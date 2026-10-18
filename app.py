@@ -124,6 +124,209 @@ def lookup_releases(disc_id, toc=None):
     return out
 
 
+def cddb_disc_id(offsets, leadout):
+    n = sum(sum(int(c) for c in str(o // 75)) for o in offsets)
+    t = leadout // 75 - offsets[0] // 75
+    return f"{((n % 255) << 24) | (t << 8) | len(offsets):08x}"
+
+
+def lookup_gnudb(toc_string):
+    """GnuDB(CDDB 호환)에서 TOC로 조회. 한국 CD가 MusicBrainz보다 많이 등록돼 있다."""
+    parts = [int(x) for x in toc_string.split()]
+    first, last, leadout = parts[0], parts[1], parts[2]
+    offsets = parts[3:3 + (last - first + 1)]
+    did = cddb_disc_id(offsets, leadout)
+    url = "http://gnudb.gnudb.org/~cddb/cddb.cgi"
+    hello = "hello=cdshelf+localhost+xmcd+2.5&proto=6"  # GnuDB는 등록된 클라이언트명만 허용
+
+    def call(cmd):
+        r = requests.get(f"{url}?cmd={cmd}&{hello}", timeout=15)
+        r.encoding = "utf-8"
+        return r.text.splitlines()
+
+    q = f"cddb+query+{did}+{len(offsets)}+" + "+".join(map(str, offsets)) + f"+{leadout // 75}"
+    lines = call(q)
+    if not lines:
+        return []
+    code = lines[0][:3]
+    if code == "200":
+        hits = [lines[0][4:]]
+    elif code in ("210", "211"):
+        hits = [l for l in lines[1:] if l and l != "."]
+    else:
+        return []
+    out = []
+    for h in hits[:5]:
+        cat, hid, rest = h.split(" ", 2)
+        data = call(f"cddb+read+{cat}+{hid}")
+        if not data or data[0][:3] != "210":
+            continue
+        titles, tr, year = "", {}, ""
+        for l in data[1:]:
+            if l.startswith("DTITLE="):
+                titles += l[7:]
+            elif l.startswith("DYEAR="):
+                year = l[6:].strip()
+            elif l.startswith("TTITLE"):
+                k, _, v = l[6:].partition("=")
+                if k.isdigit():
+                    tr[int(k)] = tr.get(int(k), "") + v
+        artist, _, title = titles.partition(" / ")
+        if not title:
+            artist, title = "", titles
+        tracks = []
+        for i in range(len(offsets)):
+            end = offsets[i + 1] if i + 1 < len(offsets) else leadout
+            tracks.append({"number": i + 1, "title": tr.get(i, f"Track {i + 1}").strip() or f"Track {i + 1}",
+                           "length_ms": (end - offsets[i]) * 1000 // 75})
+        out.append({"mbid": None, "discid": did, "title": title.strip(), "artist": artist.strip(),
+                    "year": year, "label": "GnuDB", "country": "", "disc_no": 1, "tracks": tracks})
+    return out
+
+
+def _dur(txt):
+    try:
+        m, sec = str(txt).split(":")[-2:]
+        return (int(m) * 60 + int(sec)) * 1000
+    except (ValueError, TypeError):
+        return 0
+
+
+def discogs_token():
+    t = os.environ.get("DISCOGS_TOKEN", "")
+    f = DATA_DIR / "discogs_token.txt"
+    if not t and f.exists():
+        t = f.read_text(encoding="utf-8").strip()
+    return t
+
+
+def search_releases_text(q):
+    """앨범명/아티스트로 여러 곳(MusicBrainz, iTunes, Deezer, Discogs)을 검색. 트랙은 저장 시점에 가져온다(lazy)."""
+    import musicbrainzngs as mb
+
+    out, errs = [], []
+
+    def add(src, id_, title, artist, year, country="", n="?"):
+        out.append({"src": src, "mbid": id_ if src == "mb" else None, "ext_id": str(id_), "lazy": True,
+                    "title": title, "artist": artist, "year": year, "label": src_names[src],
+                    "country": country, "n": n, "tracks": []})
+
+    src_names = {"mb": "MusicBrainz", "itunes": "iTunes", "deezer": "Deezer", "discogs": "Discogs"}
+
+    def run(fn):
+        try:
+            fn()
+        except Exception as ex:
+            errs.append(str(ex))
+
+    def mb_search():
+        mb.set_useragent("CDShelf", __version__, "https://github.com/cybereun/cd-shelf")
+        for rel in mb.search_releases(query=q, limit=8).get("release-list", []):
+            add("mb", rel["id"], rel["title"], rel.get("artist-credit-phrase", ""),
+                (rel.get("date") or "")[:4], rel.get("country", ""), rel.get("medium-track-count", "?"))
+
+    def itunes_search():
+        seen = set()
+        for cc in ("US", "KR"):  # 스토어마다 카탈로그가 달라 둘 다 조회
+            r = requests.get("https://itunes.apple.com/search", params={"term": q, "entity": "album",
+                                                                        "limit": 6, "country": cc}, timeout=15)
+            for x in r.json().get("results", []):
+                if x["collectionId"] in seen:
+                    continue
+                seen.add(x["collectionId"])
+                add("itunes", f'{cc}:{x["collectionId"]}', x["collectionName"], x["artistName"],
+                    (x.get("releaseDate") or "")[:4], "", x.get("trackCount", "?"))
+
+    def deezer_search():
+        for x in requests.get("https://api.deezer.com/search/album", params={"q": q, "limit": 8},
+                              timeout=15).json().get("data", []):
+            add("deezer", x["id"], x["title"], x.get("artist", {}).get("name", ""), "", "", x.get("nb_tracks", "?"))
+
+    def discogs_search():
+        tok = discogs_token()
+        if not tok:
+            return
+        r = requests.get("https://api.discogs.com/database/search",
+                         params={"q": q, "type": "release", "format": "CD", "per_page": 8, "token": tok},
+                         headers={"User-Agent": f"CDShelf/{__version__}"}, timeout=15)
+        for x in r.json().get("results", []):
+            t = x.get("title", "")
+            artist, _, title = t.partition(" - ")
+            add("discogs", x["id"], title or t, artist if title else "", str(x.get("year", "")),
+                x.get("country", ""))
+
+    for fn in (mb_search, itunes_search, deezer_search, discogs_search):
+        run(fn)
+    if not out and errs:
+        raise RuntimeError(" / ".join(errs))
+    return out
+
+
+def resolve_lazy(c):
+    src, eid = c.get("src", "mb"), c["ext_id"] if "ext_id" in c else c["mbid"]
+    if src == "mb":
+        import musicbrainzngs as mb
+
+        full = mb.get_release_by_id(eid, includes=["artists", "recordings", "labels", "media"])["release"]
+        medium = full["medium-list"][0]
+        tracks = [{"number": int(t.get("number") or t.get("position") or 0), "title": t["recording"]["title"],
+                   "length_ms": int(t.get("length") or t["recording"].get("length") or 0)}
+                  for t in medium.get("track-list", [])]
+        try:
+            c["label"] = full["label-info-list"][0]["label"]["name"]
+        except (KeyError, IndexError):
+            pass
+        c["disc_no"] = int(medium.get("position", 1))
+    elif src == "itunes":
+        cc, _, eid = eid.partition(":")
+        res = requests.get("https://itunes.apple.com/lookup", params={"id": eid, "entity": "song", "country": cc},
+                           timeout=15).json()["results"]
+        tracks = [{"number": x["trackNumber"], "title": x["trackName"], "length_ms": x.get("trackTimeMillis", 0)}
+                  for x in res if x.get("wrapperType") == "track" and x.get("discNumber", 1) == 1]
+        if res and res[0].get("artworkUrl100"):
+            c["cover_url"] = res[0]["artworkUrl100"].replace("100x100bb", "600x600bb")
+    elif src == "deezer":
+        d = requests.get(f"https://api.deezer.com/album/{eid}", timeout=15).json()
+        tracks = [{"number": i + 1, "title": t["title"], "length_ms": t.get("duration", 0) * 1000}
+                  for i, t in enumerate(d.get("tracks", {}).get("data", []))]
+        c["cover_url"] = d.get("cover_big") or d.get("cover_medium")
+        c["year"] = c.get("year") or (d.get("release_date") or "")[:4]
+    else:  # discogs
+        d = requests.get(f"https://api.discogs.com/releases/{eid}", params={"token": discogs_token()},
+                         headers={"User-Agent": f"CDShelf/{__version__}"}, timeout=15).json()
+        tracks = [{"number": i + 1, "title": t["title"], "length_ms": _dur(t.get("duration"))}
+                  for i, t in enumerate(x for x in d.get("tracklist", []) if x.get("type_", "track") == "track")]
+        if d.get("images"):
+            c["cover_url"] = d["images"][0].get("uri150") and d["images"][0].get("uri")
+        c["year"] = c.get("year") or str(d.get("year", ""))
+    c.update(tracks=tracks, lazy=False)
+    return c
+
+
+def cover_from_itunes(artist, title):
+    """표지 보충: iTunes에서 앨범 표지를 찾는다."""
+    try:
+        r = requests.get("https://itunes.apple.com/search", params={"term": f"{artist} {title}".strip(),
+                         "entity": "album", "limit": 1}, timeout=15).json().get("results", [])
+        if r:
+            return r[0]["artworkUrl100"].replace("100x100bb", "600x600bb")
+    except (requests.RequestException, ValueError, KeyError):
+        pass
+    return None
+
+
+def download_cover(url, key):
+    try:
+        r = requests.get(url, timeout=20, headers={"User-Agent": f"CDShelf/{__version__}"})
+        if r.status_code == 200 and r.content:
+            fname = f"{key}.jpg"
+            (COVER_DIR / fname).write_bytes(r.content)
+            return fname
+    except requests.RequestException:
+        pass
+    return None
+
+
 def fetch_cover(mbid):
     try:
         r = requests.get(f"https://coverartarchive.org/release/{mbid}/front-500", timeout=15)
@@ -142,6 +345,12 @@ def save_album(data):
         if exists:
             return exists["id"], False
         cover = fetch_cover(data["mbid"]) if data.get("mbid") else None
+        key = data.get("mbid") or f"x{abs(hash((data['title'], data.get('artist'))))}"
+        if not cover and data.get("cover_url"):
+            cover = download_cover(data["cover_url"], key)
+        if not cover and data.get("artist") is not None:
+            url = cover_from_itunes(data.get("artist") or "", data["title"])
+            cover = download_cover(url, key) if url else None
         cur = con.execute(
             "INSERT INTO albums (mbid, discid, title, artist, year, label, country, cover) VALUES (?,?,?,?,?,?,?,?)",
             (data.get("mbid"), data.get("discid"), data["title"], data.get("artist"), data.get("year"),
@@ -345,17 +554,24 @@ def covers(f):
 
 
 @app.route("/scan", methods=["GET", "POST"])
-def scan():
-    msg = ""
-    if request.method == "POST":
+def scan(msg=""):
+    if request.method == "POST" and request.endpoint == "scan":
         PENDING.clear()
         try:
             disc = read_disc()
-            found = lookup_releases(disc.id, disc.toc_string)
+            found, errs = [], []
+            for name, fn in (("MusicBrainz", lambda: lookup_releases(disc.id, disc.toc_string)),
+                             ("GnuDB", lambda: lookup_gnudb(disc.toc_string))):
+                try:
+                    found += fn()
+                except Exception as ex:  # 한 곳이 실패해도 다른 곳은 계속 조회
+                    errs.append(f"{name}: {ex}")
             PENDING.extend(found)
             if not found:
-                msg = (f'CD는 정상적으로 읽었지만(트랙 {len(disc.tracks)}개) MusicBrainz 데이터베이스에 '
-                       f'이 디스크(ID {disc.id})가 등록돼 있지 않습니다. 아래 수동 입력을 쓰세요.')
+                msg = (f'CD는 정상적으로 읽었지만(트랙 {len(disc.tracks)}개) MusicBrainz·GnuDB에 '
+                       f'이 디스크(ID {disc.id})가 없습니다. 아래에서 앨범명으로 검색하거나 수동 입력하세요.')
+                if errs:
+                    msg += " (" + " / ".join(errs) + ")"
         except ImportError:
             msg = "CD 읽기 라이브러리(discid)를 불러오지 못했습니다."
         except Exception as ex:  # 드라이브 비어 있음, 네트워크 오류 등
@@ -364,11 +580,14 @@ def scan():
     for i, c in enumerate(PENDING):
         cand += f'''<form method="post" action="/scan/save" class="card" style="padding:12px;margin-bottom:10px;display:block">
         <input type="hidden" name="i" value="{i}"><b>{e(c["title"])}</b> — {e(c["artist"])}
-        <div class="sub">{e(c["year"])} · {e(c["label"])} · {e(c["country"])} · {len(c["tracks"])}곡</div>
+        <div class="sub">{e(c["year"])} · {e(c["label"])} · {e(c["country"])} · {c.get("n") or len(c["tracks"])}곡</div>
         <button style="margin-top:8px">이 앨범으로 저장</button></form>'''
     body = f"""<h2>CD 등록</h2><p class="sub">CD를 드라이브에 넣고 버튼을 누르세요.</p>
     {f'<div class="msg">{e(msg)}</div>' if msg else ''}
     <form method="post"><button>💿 CD 읽기</button></form><br>{cand}
+    <hr style="border-color:#2a2a2d;margin:24px 0"><h3>앨범명·아티스트로 검색</h3>
+    <form method="post" action="/scan/search" style="display:flex;gap:6px">
+    <input name="q" placeholder="예: 아이유 Palette" required style="flex:1"><button>검색</button></form>
     <hr style="border-color:#2a2a2d;margin:24px 0"><h3>수동 입력 (조회 실패 시)</h3>
     <form method="post" action="/manual" style="display:grid;gap:8px">
     <input name="title" placeholder="앨범명" required><input name="artist" placeholder="아티스트">
@@ -382,9 +601,28 @@ def scan_save():
     idx = int(request.form["i"])
     if idx >= len(PENDING):
         return redirect("/scan")
-    aid, _ = save_album(PENDING[idx])
+    c = PENDING[idx]
+    if c.get("lazy"):
+        try:
+            resolve_lazy(c)
+        except Exception as ex:
+            return page(f'<div class="msg">트랙 정보를 가져오지 못했습니다: {e(ex)}</div><a class="btn" href="/scan">돌아가기</a>')
+    aid, _ = save_album(c)
     PENDING.clear()
     return redirect(url_for("album", aid=aid))
+
+
+@app.route("/scan/search", methods=["POST"])
+def scan_search():
+    PENDING.clear()
+    msg = ""
+    try:
+        PENDING.extend(search_releases_text(request.form["q"].strip()))
+        if not PENDING:
+            msg = "검색 결과가 없습니다. 수동 입력을 쓰세요."
+    except Exception as ex:
+        msg = f"검색 실패: {ex}"
+    return scan(msg)
 
 
 @app.route("/manual", methods=["POST"])
