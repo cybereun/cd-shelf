@@ -1,0 +1,60 @@
+name: Release build
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set version from tag
+        run: python tools/set_version.py "${{ github.ref_name }}"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Fetch libdiscid (Windows)
+        shell: pwsh
+        run: |
+          $url = "https://data.metabrainz.org/pub/musicbrainz/libdiscid/libdiscid-0.7.0-win.zip"
+          $sha = "9a7b655e30401b6b5d5d0b2906c758e0d759619ed7f60e512f369e581473c555"
+          Invoke-WebRequest $url -OutFile libdiscid.zip
+          if ((Get-FileHash libdiscid.zip -Algorithm SHA256).Hash.ToLower() -ne $sha) { throw "libdiscid checksum mismatch" }
+          Expand-Archive libdiscid.zip -DestinationPath libdiscid
+          Get-ChildItem libdiscid -Recurse | Select-Object -ExpandProperty FullName
+          $dll = Get-ChildItem libdiscid -Recurse -Filter discid.dll | Where-Object { $_.FullName -match "x64" } | Select-Object -First 1
+          if (-not $dll) { throw "x64 discid.dll not found in archive" }
+          New-Item -ItemType Directory -Force vendor | Out-Null
+          Copy-Item $dll.FullName vendor/discid.dll
+
+      - name: Build app (PyInstaller)
+        run: pyinstaller cdshelf.spec --noconfirm
+
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ github.ref_name }}
+        run: |
+          $env:APP_VERSION = $env:APP_VERSION.TrimStart("v")
+          choco install innosetup -y --no-progress
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+          if (-not (Test-Path dist_installer/CDShelf-Setup.exe)) { throw "installer not produced" }
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "${{ github.ref_name }}" dist_installer/CDShelf-Setup.exe --title "CD Shelf ${{ github.ref_name }}" --generate-notes
