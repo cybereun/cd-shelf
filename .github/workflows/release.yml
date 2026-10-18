@@ -43,6 +43,7 @@ jobs:
             "SKIP=true" >> $env:GITHUB_ENV
             Write-Host "Release v$v already has CDShelf-Setup.exe - skipping build"
           }
+          $global:LASTEXITCODE = 0
 
       - name: Set version
         if: env.SKIP != 'true'
@@ -88,7 +89,9 @@ jobs:
         run: |
           $tag = "v$env:VERSION"
           gh release view $tag *> $null
-          if ($LASTEXITCODE -eq 0) {
+          $exists = ($LASTEXITCODE -eq 0)
+          $global:LASTEXITCODE = 0
+          if ($exists) {
             gh release upload $tag dist_installer/CDShelf-Setup.exe --clobber
           } else {
             gh release create $tag dist_installer/CDShelf-Setup.exe --target "${{ github.sha }}" --title "CD Shelf $tag" --generate-notes
