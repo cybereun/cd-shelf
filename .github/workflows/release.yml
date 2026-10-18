@@ -1,9 +1,16 @@
 name: Release build
 
+# version.py 를 main에 푸시하면(버전 번호를 올리면) 자동으로 빌드 후 릴리스를 만든다.
+# v* 태그 푸시, 수동 실행(Actions 탭)도 지원한다.
 on:
   push:
+    branches: [main]
+    paths:
+      - version.py
+      - .github/workflows/release.yml
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -11,6 +18,8 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -18,15 +27,35 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Set version from tag
-        run: python tools/set_version.py "${{ github.ref_name }}"
+      - name: Resolve version
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $v = "${{ github.ref_name }}".TrimStart("v")
+          } else {
+            $v = (python tools/get_version.py).Trim()
+          }
+          "VERSION=$v" >> $env:GITHUB_ENV
+          Write-Host "Version: $v"
+          # 이미 설치 파일이 올라간 릴리스면 건너뛴다
+          $assets = gh release view "v$v" --json assets --jq ".assets[].name" 2>$null
+          if ($LASTEXITCODE -eq 0 -and ($assets -contains "CDShelf-Setup.exe")) {
+            "SKIP=true" >> $env:GITHUB_ENV
+            Write-Host "Release v$v already has CDShelf-Setup.exe - skipping build"
+          }
+
+      - name: Set version
+        if: env.SKIP != 'true'
+        run: python tools/set_version.py "${{ env.VERSION }}"
 
       - name: Install Python dependencies
+        if: env.SKIP != 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
       - name: Fetch libdiscid (Windows)
+        if: env.SKIP != 'true'
         shell: pwsh
         run: |
           $url = "https://data.metabrainz.org/pub/musicbrainz/libdiscid/libdiscid-0.7.0-win.zip"
@@ -41,27 +70,26 @@ jobs:
           Copy-Item $dll.FullName vendor/discid.dll
 
       - name: Build app (PyInstaller)
+        if: env.SKIP != 'true'
         run: pyinstaller cdshelf.spec --noconfirm
 
       - name: Build installer (Inno Setup)
+        if: env.SKIP != 'true'
         shell: pwsh
-        env:
-          APP_VERSION: ${{ github.ref_name }}
         run: |
-          $env:APP_VERSION = $env:APP_VERSION.TrimStart("v")
+          $env:APP_VERSION = $env:VERSION
           choco install innosetup -y --no-progress
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
           if (-not (Test-Path dist_installer/CDShelf-Setup.exe)) { throw "installer not produced" }
 
       - name: Publish GitHub Release
+        if: env.SKIP != 'true'
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $tag = "${{ github.ref_name }}"
+          $tag = "v$env:VERSION"
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag dist_installer/CDShelf-Setup.exe --clobber
           } else {
-            gh release create $tag dist_installer/CDShelf-Setup.exe --title "CD Shelf $tag" --generate-notes
+            gh release create $tag dist_installer/CDShelf-Setup.exe --target "${{ github.sha }}" --title "CD Shelf $tag" --generate-notes
           }
