@@ -71,13 +71,20 @@ def read_disc():
     return discid.read()  # 기본 CD 드라이브
 
 
-def lookup_releases(disc_id):
+def lookup_releases(disc_id, toc=None):
     import musicbrainzngs as mb
 
     mb.set_useragent("CDShelf", __version__, "https://github.com/cybereun/cd-shelf")
-    res = mb.get_releases_by_discid(disc_id, includes=["artists", "recordings", "labels"])
+    includes = ["artists", "recordings", "labels"]
+    try:
+        # toc를 같이 보내면 정확한 ID가 없을 때 트랙 구성이 비슷한 릴리스를 대신 찾아준다
+        res = mb.get_releases_by_discid(disc_id, includes=includes, toc=toc)
+    except mb.ResponseError as ex:
+        if getattr(ex.cause, "code", None) == 404:  # MusicBrainz에 없는 디스크
+            return []
+        raise
     out = []
-    for rel in res.get("disc", {}).get("release-list", []):
+    for rel in res.get("disc", {}).get("release-list", []) or res.get("release-list", []):
         medium = None
         for m in rel.get("medium-list", []):
             if any(d.get("id") == disc_id for d in m.get("disc-list", [])):
@@ -344,10 +351,11 @@ def scan():
         PENDING.clear()
         try:
             disc = read_disc()
-            found = lookup_releases(disc.id)
+            found = lookup_releases(disc.id, disc.toc_string)
             PENDING.extend(found)
             if not found:
-                msg = f'MusicBrainz에 이 디스크(ID {disc.id})가 없습니다. 아래 수동 입력을 쓰세요.'
+                msg = (f'CD는 정상적으로 읽었지만(트랙 {len(disc.tracks)}개) MusicBrainz 데이터베이스에 '
+                       f'이 디스크(ID {disc.id})가 등록돼 있지 않습니다. 아래 수동 입력을 쓰세요.')
         except ImportError:
             msg = "CD 읽기 라이브러리(discid)를 불러오지 못했습니다."
         except Exception as ex:  # 드라이브 비어 있음, 네트워크 오류 등
